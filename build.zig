@@ -15,21 +15,22 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
-    const exe = b.addExecutable(.{
+    const disable_strip = b.option(bool, "nostrip", "Disable stripping binaries, default is to strip release binaries") orelse false;
+
+    const is_debug = optimize == .Debug;
+
+    var exe_options: std.Build.ExecutableOptions = .{
         .name = "llama2",
         // In this case the main source file is merely a path, however, in more
         // complicated build scripts, this could be a generated file.
         .root_source_file = .{ .path = "src/main.zig" },
         .target = target,
         .optimize = optimize,
-    });
-
-    const disable_strip = b.option(bool, "nostrip", "Disable stripping binaries, default is to strip release binaries") orelse false;
-
-    const is_debug = optimize == .Debug;
+    };
     if (!is_debug and !disable_strip) {
-        exe.strip = true;
+        exe_options.strip = true;
     }
+    const exe = b.addExecutable(exe_options);
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
