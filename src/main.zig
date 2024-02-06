@@ -167,6 +167,7 @@ const Tokenizer = struct {
     const Self = @This();
 
     tokens: [][]u8,
+    token_lookup: std.StringHashMap(u32),
     scores: []f32,
     max_token_len: u32,
 
@@ -181,23 +182,26 @@ const Tokenizer = struct {
     fn init(reader: anytype, allocator: Allocator, vocab_size: usize) !Tokenizer {
         var tokens: Tokenizer = undefined;
         tokens.tokens = try allocator.alloc([]u8, vocab_size);
+        tokens.token_lookup = std.StringHashMap(u32).init(allocator);
         tokens.scores = try allocator.alloc(f32, vocab_size);
         tokens.max_token_len = try reader.readInt(@TypeOf(tokens.max_token_len), .little);
 
         for (0..vocab_size) |i| {
             tokens.scores[i] = @bitCast(try reader.readInt(u32, .little));
-            const token_len = try reader.readInt(u32, .little);
-            tokens.tokens[i] = try allocator.alloc(u8, token_len);
-            const read_amt = try reader.read(tokens.tokens[i]);
-            if (read_amt != token_len) {
-                return error.UnexpectedEof;
+            const len: usize = @intCast(try reader.readInt(u32, .little));
+            tokens.tokens[i] = try allocator.alloc(u8, len);
+            _ = try reader.read(tokens.tokens[i]);
+            const v = try tokens.token_lookup.getOrPut(tokens.tokens[i]);
+            if (!v.found_existing) {
+                v.value_ptr.* = @intCast(i);
             }
         }
 
         return tokens;
     }
 
-    fn deinit(self: *const Self, allocator: Allocator) void {
+    fn deinit(self: *Self, allocator: Allocator) void {
+        self.token_lookup.deinit();
         for (self.tokens) |token| {
             allocator.free(token);
         }
@@ -208,81 +212,63 @@ const Tokenizer = struct {
     /// Given a string, find the index of the token that matches it exactly. If
     /// no token matches, returns none.
     fn lookup(self: *const Self, str: []const u8) ?u32 {
-        for (self.tokens, 0..) |token, i| {
-            if (std.mem.eql(u8, token, str)) {
-                return @intCast(i);
-            }
-        }
-        return null;
+        return self.token_lookup.get(str);
     }
 
     /// Given a string, returns the encoding as a list of tokens. You are
     /// responsible for freeing the returned list.
     fn encode(self: *const Tokenizer, input: []const u8, allocator: Allocator) ![]u32 {
-        var token_buf: []u32 = try allocator.alloc(u32, input.len); // worst case is every byte is a token
-
-        const max_allowed_token_len = 128;
-        if (self.max_token_len * 2 > max_allowed_token_len) { // x2 for concat
-            return error.TokensTooLong;
+        const tok_buff = try allocator.alloc(u32, input.len);
+        const max_allowed_tok_len = 128;
+        if (self.max_token_len * 2 > max_allowed_tok_len) {
+            return error.TokensExceedMaxLength;
         }
 
-        // need an allocator for doing string concatenation, used fixed buffer
-        // allocator so we don't need to allocate any memory outside the stack
-        var buffer: [max_allowed_token_len]u8 = undefined;
-        var fba = std.heap.FixedBufferAllocator.init(&buffer);
-        const fixed_allocator = fba.allocator();
-
-        var utf_encoded_buffer: [4]u8 = undefined;
+        var utf_enc_buff: [4]u8 = undefined;
         var idx: usize = 0;
-        var token_end_idx: usize = 0;
+        var tok_end_idx: usize = 0;
         while (idx < input.len) {
             const utf_len = try std.unicode.utf8ByteSequenceLength(input[idx]);
             const codepoint: u21 = try std.unicode.utf8Decode(input[idx..][0..utf_len]);
-            const encoded_len = try std.unicode.utf8Encode(codepoint, &utf_encoded_buffer);
-            token_buf[token_end_idx] = self.lookup(utf_encoded_buffer[0..encoded_len]) orelse {
+            const enc_len = try std.unicode.utf8Encode(codepoint, &utf_enc_buff);
+            tok_buff[tok_end_idx] = self.lookup(utf_enc_buff[0..enc_len]) orelse {
                 return error.TokenNotFound;
             };
-            token_end_idx += 1; // we have one more token now
-            idx += utf_len; // skip over the utf8 sequence
+            tok_end_idx += 1;
+            idx += utf_len;
         }
 
         while (true) {
             var best_score: f32 = -1e10;
             var best_id: u32 = 0;
             var best_idx: ?usize = null;
-
-            // find the best token to merge
-            for (0..token_end_idx - 1) |i| {
-                // check if we are able to merge the token at i with the next token
-                const catted = try std.mem.concat(fixed_allocator, u8, &[_][]u8{
-                    self.tokens[token_buf[i]],
-                    self.tokens[token_buf[i + 1]],
-                });
-                defer fixed_allocator.free(catted);
-                if (self.lookup(catted)) |token_id| {
-                    if (self.scores[token_id] > best_score) {
-                        best_score = self.scores[token_id];
-                        best_id = token_id;
+            var start_idx: usize = 0;
+            for (0..tok_end_idx - 1) |i| {
+                if (i != 0) {
+                    start_idx += self.tokens[tok_buff[i - 1]].len;
+                }
+                const concat_tokens = input[start_idx..][0 .. self.tokens[tok_buff[i]].len + self.tokens[tok_buff[i + 1]].len];
+                if (self.lookup(concat_tokens)) |id| {
+                    if (self.scores[id] > best_score) {
+                        best_score = self.scores[id];
+                        best_id = id;
                         best_idx = i;
                     }
                 }
             }
 
-            if (best_idx) |best| {
-                // merge the best token and shift the rest of the tokens down
-                token_buf[best] = best_id;
-                std.mem.copyForwards(u32, token_buf[best + 1 ..], token_buf[best + 2 .. token_end_idx]);
-                token_end_idx -= 1;
+            if (best_idx) |bidx| {
+                tok_buff[bidx] = best_id;
+                std.mem.copyForwards(u32, tok_buff[bidx + 1 ..], tok_buff[bidx + 2 .. tok_end_idx]);
+                tok_end_idx -= 1;
             } else {
-                // if we didn't find any tokens to merge, we are done
                 break;
             }
         }
-
-        if (!allocator.resize(token_buf, token_end_idx)) {
+        if (!allocator.resize(tok_buff, tok_end_idx)) {
             return error.OutOfMemory;
         }
-        return token_buf[0..token_end_idx];
+        return tok_buff[0..tok_end_idx];
     }
 };
 
@@ -901,7 +887,7 @@ pub fn main() !void {
     const weights = Weights.init(&config, data, shared_weights);
 
     // load the tokens for the model
-    const tokenizer = try Tokenizer.fromFile(tokenizer_path, config.vocab_size, allocator);
+    var tokenizer = try Tokenizer.fromFile(tokenizer_path, config.vocab_size, allocator);
     defer tokenizer.deinit(allocator);
 
     // initialize the run state for inference
